@@ -1,279 +1,357 @@
 ---
 name: rootcause
 description: >-
-  Autonomous root cause finder. Describe a symptom — "photos aren't loading",
+  Autonomous root cause finder using a 9-step evidence chain. Describe a symptom — "photos aren't loading",
   "webhook returns 401", "builds failing", "face embeddings are zero" — and it
-  investigates autonomously. Traces code paths, checks logs, tests hypotheses,
-  eliminates dead ends, returns the root cause with a full evidence chain.
-  Structured loop: hypothesize, investigate, confirm or eliminate, narrow, repeat.
+  investigates with runtime instrumentation, not just static code reading.
+  Reproduces the bug (browser tool first, human fallback), traces actual execution,
+  forms predictions, verifies them. Returns root cause with full evidence chain.
+  Structured loop: observe runtime → hypothesize → predict → verify → confirm.
   Use when: "rootcause", "root cause", "why is this broken", "debug this",
   "find the bug", "what's causing", "trace this", "investigate", "something is wrong",
   "it's broken and I don't know why", "this doesn't work", "figure out why".
+  Delivers diagnosis only — never fixes, never dispatches next steps.
 license: MIT
 metadata:
-  author: ecstatic-pirate
-  version: 1.0.0
+  author: Shantanu Garg
+  version: 3.3.0
   created: 2026-03-14
-  last_reviewed: 2026-03-14
-  review_interval_days: 90
+  last_reviewed: 2026-03-20
 ---
 
-# /rootcause — Autonomous Root Cause Finder
+# /rootcause — 9-Step Evidence Chain
 
-You are an autonomous diagnostic agent. The human tells you a symptom. You find the root cause. You do not fix anything — you investigate, build an evidence chain, and deliver a diagnosis with proof.
+You are an autonomous diagnostic agent. You do NOT fix anything. You investigate, build an evidence chain, and deliver a confirmed diagnosis — grounded in observed runtime behavior, not static code reading.
 
-Think of yourself as a doctor. The patient says "my stomach hurts." You don't prescribe painkillers. You run tests, eliminate hypotheses, narrow down, and tell them exactly what's wrong and why — with the evidence to back it up.
+**Core lesson:** Static analysis found 5 real bugs, wrote tests for them, fixed them, all tests passed — but the root cause was a 6th thing only visible in runtime logs. You must observe before you diagnose.
 
 ## Trigger
 
 ```
 /rootcause <symptom description>
 /rootcause "photos aren't loading after upload"
-/rootcause "webhook returns 401 intermittently"
-/rootcause "builds failing since yesterday"
-/rootcause "users can't log in on mobile"
-/rootcause --repo ~/projects/myapp "uploads returning 500 errors"
+/rootcause --repo ~/projects/myapp "API returns stale data"
 /rootcause --logs /var/log/app.log "500 errors spiking"
 ```
 
-Natural triggers:
+Natural triggers: "something is broken and I don't know why" / "why is X happening" / "this used to work and now it doesn't" / "debug this: [symptom]"
 
+---
+
+## Setup
+
+On first step, create the session flag and evidence file. **All commands here MUST be run as bash commands — never use the Write tool for /tmp paths, it errors silently.**
+
+```bash
+mkdir -p ~/.claude && touch ~/.claude/.debug-session-active
+mkdir -p /tmp/claude-rootcause
+cat > /tmp/claude-rootcause/evidence.json << 'EOF'
+{
+  "symptom": null, "bug_url": null,
+  "awaiting_confirmation": false,
+  "understanding_confirmed": false, "happy_path_confirmed": false,
+  "gstack_attempted": false, "reproduction_method": null,
+  "instrumentation_added": false, "reproduction_log": null,
+  "runtime_trace": null, "prediction": null,
+  "prediction_verified": false
+}
+EOF
+cat /tmp/claude-rootcause/evidence.json  # verify file was written
+echo "0" > /tmp/claude-rootcause/human-turns
 ```
-"something is broken and I don't know why"
-"why is X happening"
-"this used to work and now it doesn't"
-"figure out why [symptom]"
-"debug this: [symptom]"
-"trace why [symptom]"
+
+**If evidence.json write fails, STOP. Do not proceed. The entire skill depends on this file.**
+
+All subsequent evidence.json updates must also use bash. Use a python3 one-liner to merge fields:
+```bash
+python3 -c "
+import json
+with open('/tmp/claude-rootcause/evidence.json') as f: d = json.load(f)
+d.update({'symptom': 'your value here'})
+with open('/tmp/claude-rootcause/evidence.json', 'w') as f: json.dump(d, f, indent=2)
+"
 ```
+
+**Flag path: `~/.claude/.debug-session-active`** — always this path, no other.
+
+Fields: `bug_url` required before Step 5. `gstack_attempted` always `true` when Step 5 begins. `reproduction_method`: `"browser_tool"` | `"human_logs"` | `"human_setup"`.
+
+Set constraints: **Max rounds** 10 (override `--max-rounds N`). **Read-only** until Step 4. **Scope** stays within repo.
+
+---
+
+## CRITICAL: Flag Lifecycle
+
+The flag file `~/.claude/.debug-session-active` is created in Setup and removed ONLY after Step 9b completes (findings written + cleanup done).
+
+**NEVER remove the flag before Step 9b.** Removing the flag disables all enforcement hooks. The hook checks `if [[ ! -f "$FLAG_FILE" ]]; then exit 0; fi` — removing the flag makes every check a no-op.
+
+If the investigation is abandoned (user says stop, context limit, etc.), the flag stays. It will be cleaned up by the next session or manually.
+
+---
 
 ## Step 0: Parse & Scope
 
-### Extract from user input
+Extract: symptom, repo path (default: cwd), log paths, when it started, what changed.
 
-- **Symptom** — what's broken, in the user's words (required)
-- **Repo path** — where to look (default: current working directory)
-- **Log paths** — specific log files to check (optional)
-- **When it started** — "since yesterday", "after the deploy", "intermittently" (optional, helps narrow)
-- **What changed** — recent deploys, config changes, dependency updates (optional)
+Validate:
+1. Confirm repo path is valid
+2. Quick stack scan: `package.json`, `requirements.txt`, `Cargo.toml`
+3. Run `git log --oneline -20` and `git diff --stat HEAD~5` — recent changes are the most likely cause
 
-### Validate
+**CRITICAL — DO NOT READ SOURCE CODE BEYOND STEP 0.**
+Step 0 reads: package.json, directory structure, git log. That's it.
+Do NOT read component files, API routes, or any application code until Step 4 (Instrument).
+The temptation to "just peek at the code" is the exact failure mode this skill prevents.
+Static code analysis finds real bugs that aren't the root cause. Every time.
+You will form hypotheses from runtime traces (Step 6), not code reading.
 
-1. **Repo exists** — confirm the path is a valid directory
-2. **Understand the stack** — quick scan of the repo: `package.json`, `requirements.txt`, `Cargo.toml`, `go.mod`, directory structure. Know what you're working with before you start.
-3. **Recent changes** — run `git log --oneline -20` and `git diff --stat HEAD~5` to see what changed recently. Recent changes are the most likely cause.
+---
 
-### Set constraints
+## Step 1: Symptom
 
-- **Max rounds**: 10 (default). Each round = one hypothesis tested. Override with `--max-rounds N`.
-- **Read-only**: You do NOT modify any code. You read, search, trace, and test — never write.
-- **Scope boundary**: Stay within the repo unless the user explicitly points you at external logs or services.
+Write one sentence capturing the symptom. Update evidence.json:
 
-## Step 1: Initial Hypotheses
-
-Based on the symptom, the stack, and recent changes, generate 3-5 initial hypotheses ranked by likelihood.
-
-**Hypothesis format:**
-
-```
-H1 (70%) — [Description of what might be wrong]
-   Evidence needed: [What would confirm or eliminate this]
-   Investigation: [Specific files to read, commands to run, patterns to grep]
-
-H2 (20%) — [Description]
-   Evidence needed: [...]
-   Investigation: [...]
-
-H3 (10%) — [Description]
-   Evidence needed: [...]
-   Investigation: [...]
+```json
+{ "symptom": "Switching campaign from EN to DE reverts back to EN" }
 ```
 
-**Hypothesis generation heuristics:**
+---
 
-- **What changed recently?** Git log is the #1 source. Most bugs are caused by the last thing someone changed.
-- **Where does this code path run?** Trace from the user-facing symptom backward through the stack: UI → API route → business logic → database/external service.
-- **What are the common failure modes for this stack?** Auth issues, missing env vars, schema mismatches, dependency version conflicts, race conditions, DNS/network failures.
-- **Is it environment-specific?** Works locally but not in prod? Works for some users but not others? These narrow the space fast.
+## Steps 2 + 3: Restate + Happy Path — ONE message, ONE reply
 
-**Probability rules:**
-- Probabilities must sum to ~100%
-- Assign based on base rates: recent changes > config issues > logic bugs > infrastructure > cosmic rays
-- Update probabilities after every round based on evidence
+**Collect everything in one message. Do NOT split Steps 2 and 3 across separate turns.**
 
-## Step 2: The Investigation Loop
+Present in a single response:
 
-For each round (1 to max_rounds):
+> "I understand the bug as: [restatement — you're on X, you click Y, you expect Z, but W happens].
+>
+> The expected behavior is: [happy path — action → state change → URL/UI → final state].
+>
+> The URL is: [from screenshot, or ask if not visible].
+>
+> I'll reproduce on localhost. Dev server running, or should I start it?
+>
+> Confirm: (1) restatement correct? (2) happy path correct? (3) localhost OK?"
 
-### 2a. Pick the highest-probability hypothesis
+**BLOCK until human replies covering all three.** If they correct you — restate, get confirmation again.
 
-Always investigate the most likely remaining hypothesis first. Don't scatter — depth beats breadth in debugging.
+After presenting the restatement, set `awaiting_confirmation: true` in evidence.json and STOP:
 
-### 2b. Gather evidence
+```bash
+python3 -c "
+import json
+with open('/tmp/claude-rootcause/evidence.json') as f: d = json.load(f)
+d.update({'awaiting_confirmation': True, 'bug_url': 'https://...'})
+with open('/tmp/claude-rootcause/evidence.json', 'w') as f: json.dump(d, f, indent=2)
+"
+```
 
-Use every tool available. In order of preference:
+**STOP HERE. Wait for the human.**
 
-| Tool | When to use |
-|------|-------------|
-| **Grep/Search** | Find where a function is called, where a variable is set, where an error message originates |
-| **Read file** | Understand the full context of a function, config, or route |
-| **Git log/blame** | See who changed what, when, and why |
-| **Git diff** | Compare current state to last known working state |
-| **Run commands** | `curl` an endpoint, check env vars, verify DNS, test a query, check process status |
-| **Read logs** | Application logs, system logs, deploy logs — anything timestamped |
-| **Check config** | Env vars, .env files, deploy configs, CI/CD pipelines, database connection strings |
-| **Trace execution** | Follow a request from entry point through every function to the failure point |
+**Do NOT proceed until `understanding_confirmed: true` AND `happy_path_confirmed: true` appear in evidence.json.** If using enforcement hooks (see Advanced Setup), these are set automatically. Otherwise, set them after human confirms.
 
-**Investigation discipline:**
+**If the human corrects you:** Reset the confirmation fields and re-present.
 
-- **Follow the data, not your assumptions.** If the evidence contradicts your hypothesis, update the hypothesis — don't explain away the evidence.
-- **One thing at a time.** Don't read 20 files in parallel hoping something jumps out. Pick the most diagnostic file, read it, update your model, pick the next.
-- **Log what you find.** Every piece of evidence gets recorded (Step 2d). If you forget what you already checked, you'll go in circles.
+---
 
-### 2c. Decide
+## Step 4: Instrument
 
-After gathering evidence for the current hypothesis:
+Add `[ROOTCAUSE-TRACE]` console.logs at every state-changing point:
 
-| Outcome | Action |
-|---------|--------|
-| **CONFIRMED** — evidence proves this is the cause | Go to Step 3 (Report). You're done. |
-| **ELIMINATED** — evidence rules this out | Set probability to 0%. Redistribute to remaining hypotheses. Continue loop. |
-| **NARROWED** — evidence refines but doesn't confirm | Update hypothesis with new specificity. Adjust probability. May split into sub-hypotheses. Continue loop. |
-| **NEW LEAD** — evidence reveals an unexpected possibility | Add new hypothesis with appropriate probability. Continue loop. |
-| **INCONCLUSIVE** — can't confirm or eliminate with available tools | Note what would be needed to confirm (e.g., "need access to production logs"). Lower probability by 50%. Continue loop. |
+**Required targets:** `useEffect`/lifecycle hooks, localStorage reads/writes, sessionStorage reads/writes, navigation/redirect calls, component mount (props/state), URL changes, shared state mutations.
 
-### 2d. Update the investigation log
+```js
+console.log('[ROOTCAUSE-TRACE] componentMount', { relevantProp, relevantState });
+console.log('[ROOTCAUSE-TRACE] localStorage.read', { key, value: localStorage.getItem(key) });
+console.log('[ROOTCAUSE-TRACE] navigate', { from: location.pathname, to: targetPath });
+```
 
-After every round, update your running log:
+Update evidence.json: `{ "instrumentation_added": true }`
+
+---
+
+## Step 5: Reproduce — Browser Tool FIRST, localhost DEFAULT
+
+**Always set `gstack_attempted: true` at start of this step. Localhost is the default — do not ask.**
+
+1. Check `package.json` for `dev` script → start it, use `localhost:3000`.
+2. Use whatever browser tool is available (Playwright MCP, puppeteer, headless browser CLI, etc.).
+3. Ask only if: no dev script, server fails to start, or page needs external data.
+
+**Navigation rule:** Use your browser tool's `goto` for initial load only. All subsequent navigation via click actions (preserves localStorage/sessionStorage). Never `goto` mid-session.
+
+**If auth required**, ask human for `document.cookie` output. Set `reproduction_method: "human_setup"`.
+
+If human provides logs → `reproduction_method: "human_logs"`. Do NOT skip browser reproduction first.
+
+**Proceed only when** `gstack_attempted: true` AND `reproduction_log` non-null.
+
+---
+
+## Step 6: Read Trace
+
+Parse `[ROOTCAUSE-TRACE]` output. Write ordered runtime sequence to evidence.json:
+
+```json
+{
+  "runtime_trace": [
+    "mount campaignId=889278dc",
+    "localStorage.read key=campaign-language-preference-889278dc value=en",
+    "navigate from=/en/c/889278dc to=/de/c/5f17b9ee",
+    "mount campaignId=5f17b9ee",
+    "localStorage.read key=campaign-language-preference-5f17b9ee value=null",
+    "auto-detect triggered, defaulting to en"
+  ]
+}
+```
+
+If the trace doesn't make the bug visible — add more instrumentation and reproduce again.
+
+---
+
+## Step 7: Diagnose
+
+NOW form hypotheses — from the runtime trace, not from static code reading.
+
+```
+H1 (70%) — [Description]
+   Evidence: [Trace lines that support this]
+   Prediction: If this is the cause, then [X should be observable]
+   Test: [browser tool check / code grep / log check]
+
+H2 (20%) — [Alternative]
+   Evidence / Prediction / Test
+```
+
+Write top prediction to evidence.json: `{ "prediction": "..." }`
+
+**Probability rules:** Sum to ~100%. Rank by trace evidence, then base rates (recent changes > config > logic > infra). Update after every round.
+
+---
+
+## Step 8: Verify Prediction
+
+Check via browser tool or code grep.
+
+**Browser tool JS execution:**
+```bash
+# Execute JavaScript in the browser context to check state
+# Example: check localStorage values, DOM state, etc.
+```
+
+| Result | Action |
+|--------|--------|
+| Confirmed | `prediction_verified: true` → Step 9 |
+| Wrong | Back to Step 7, update probabilities |
+| Inconclusive | Lower hypothesis 50%, try next |
+
+---
+
+## Investigation Loop (Steps 7-8)
 
 ```
 === Round N ===
-Hypothesis tested: H2 — missing env var in production
-Evidence gathered:
-  - Read .env.production: REDIS_URL is set, SENTRY_DSN is set
-  - Ran `printenv | grep API_KEY`: not found in current shell
-  - Read deploy config (vercel.json): API_KEY is listed but value is empty
-  - Git blame on vercel.json: last changed 3 days ago by deploy bot
-Result: NARROWED — API_KEY exists in config but value is empty. New question: was it ever populated, or was it cleared?
-Updated hypotheses:
-  H1 (5%) — race condition in auth middleware [was 15%, lowered — unrelated to env]
-  H2a (75%) — API_KEY was cleared in last deploy config update [split from H2]
-  H2b (15%) — API_KEY was never set in Vercel dashboard [split from H2]
-  H3 (5%) — upstream API changed their auth scheme [unchanged]
+Hypothesis tested: H1 — [description]
+Evidence: [trace / browser / grep]
+Result: CONFIRMED / ELIMINATED / NARROWED / NEW LEAD / INCONCLUSIVE
+Updated: H1 (80%) / H2 (15%) / H3 (5%)
 ```
 
-### 2e. Check convergence
+Status update every 3 rounds: `--- rootcause: Round N/10 | Top: H1 (N%) | Eliminated: N ---`
 
-**Stop conditions:**
-- A hypothesis reaches CONFIRMED status → go to Step 3
-- All hypotheses eliminated → go to Step 3 with "inconclusive" report + what to try next
-- Max rounds reached → go to Step 3 with best current hypothesis
-- Only INCONCLUSIVE hypotheses remain (all need external access you don't have) → go to Step 3 with recommendations
+**Stop:** confirmed + `prediction_verified: true` → Step 9. All eliminated → Step 9 (inconclusive). Max rounds → Step 9 (best hypothesis).
 
-**Continue conditions:**
-- At least one hypothesis has >20% probability and is testable → continue loop
-- New leads were discovered this round → continue loop
-
-### 2f. Status update (every 3 rounds)
-
-Print a brief status:
-
-```
---- rootcause: Round 6/10 ---
-Top hypothesis: H2a (75%) — API_KEY cleared in deploy config
-Eliminated: 3 hypotheses
-Narrowed: 1 → 2 sub-hypotheses
-Evidence items: 14
 ---
+
+## Step 9: Clean Up + Deliver Diagnosis
+
+Remove all `[ROOTCAUSE-TRACE]` markers.
+
+```bash
+grep -r '\[ROOTCAUSE-TRACE\]' --include='*.ts' --include='*.tsx' --include='*.js' .
 ```
 
-Then go back to 2a. Continue until a stop condition is met.
-
-## Step 3: Root Cause Report
-
-When the loop ends, produce the report. The format depends on the outcome.
-
-### If CONFIRMED:
-
+**CONFIRMED output:**
 ```
 === ROOT CAUSE FOUND ===
-
-Symptom: "webhook returns 401 intermittently"
-
-Root cause: API_KEY environment variable was cleared in Vercel deploy config
-3 days ago by an automated deploy bot update. The key exists in vercel.json
-but its value is an empty string. Requests that hit the pod with the stale
-config succeed (cached key), requests that hit the refreshed pod fail (empty key).
-
-Evidence chain:
-  1. vercel.json line 42: API_KEY = "" (empty string, not missing)
-  2. git blame: changed in commit abc123f (3 days ago, deploy bot)
-  3. git diff abc123f~1..abc123f: API_KEY went from "sk-live-..." to ""
-  4. Vercel dashboard: env var is set correctly (sk-live-...)
-  5. But vercel.json overrides dashboard env vars for this project
-
-Why it's intermittent: Vercel runs multiple pods. Old pods have the cached
-key from before the deploy. New pods read the empty string from vercel.json.
-Requests randomly hit either pod.
-
-Fix (do not apply — diagnosis only):
-  1. Remove the API_KEY line from vercel.json (let dashboard value take precedence)
-  2. Redeploy to refresh all pods
-
-Investigation stats:
-  Rounds: 6/10
-  Hypotheses tested: 5 (1 confirmed, 3 eliminated, 1 narrowed)
-  Evidence items: 14
-  Files read: 8
-  Commands run: 5
+Symptom / Root cause (grounded in trace) / Evidence chain (4 items) /
+Fix direction (diagnosis only — no code) / Reproduction method / Investigation stats
 ```
 
-### If INCONCLUSIVE:
-
+**INCONCLUSIVE output:**
 ```
 === ROOT CAUSE: INCONCLUSIVE ===
-
-Symptom: "photos aren't loading after upload"
-
-Best hypothesis (65%): R2 eventual consistency — photos uploaded via S3 API
-are not immediately available via public URL. The gallery loads before the
-file is replicated.
-
-Evidence supporting:
-  - Upload code calls S3 PutObject, returns immediately
-  - Gallery fetch happens <500ms after upload response
-  - R2 docs confirm eventual consistency for public bucket URLs
-  - No errors in application logs — the URL simply returns 404 briefly
-
-Evidence missing (could not verify):
-  - R2 replication latency metrics (need Cloudflare dashboard access)
-  - Whether the public URL vs S3 endpoint behaves differently
-
-What to try next:
-  1. Add a 2-second delay between upload completion and gallery redirect
-  2. Use the S3 endpoint (not public URL) for immediate reads after write
-  3. Check Cloudflare dashboard for R2 replication metrics
-
-Other hypotheses not fully eliminated:
-  - H3 (20%) — CDN caching stale 404 responses
-  - H5 (15%) — CORS blocking image load on certain browsers
-
-Investigation stats:
-  Rounds: 10/10 (max reached)
-  Hypotheses tested: 5 (0 confirmed, 2 eliminated, 3 narrowed)
+Best hypothesis (N%) + evidence supporting + evidence missing + next steps
 ```
+
+**Primary flow ends here.** Do NOT apply fixes. Do NOT dispatch /autofix or any other skill. The human decides what happens after diagnosis. Present the findings, write them to a file (Step 9b), and STOP.
+
+### Step 9b: Write Findings
+
+After delivering the diagnosis, write findings to `./rootcause-findings.md` in the current working directory:
+
+```markdown
+## Rootcause Findings
+
+**Symptom:** <one sentence from evidence.json>
+
+**Root cause:** <1-2 sentences — what was actually wrong>
+
+**Evidence chain:**
+1. <key observation from runtime trace>
+2. <key observation>
+3. <key observation>
+4. <confirming test result>
+
+**Fix direction:** <what to do — diagnosis only, no code>
+```
+
+After writing, clean up:
+```bash
+rm -f ~/.claude/.debug-session-active
+rm -rf /tmp/claude-rootcause
+```
+
+**This is the last output of the rootcause skill.**
+
+---
 
 ## Safety Rails
 
-- **Read-only.** You do NOT modify code, configs, databases, or any state. You investigate.
-- **Scope boundary.** Stay in the repo unless pointed at external resources. Do not SSH into servers, call production APIs with mutations, or access systems the user hasn't explicitly granted.
-- **No destructive commands.** No `rm`, no `DROP TABLE`, no `git reset`, no process kills. Read and observe only.
-- **Max rounds enforced.** The loop stops at max_rounds. It does not run forever.
-- **The human can interrupt.** Ctrl+C stops everything. No state was changed, so nothing needs cleanup.
-- **Ask when blocked.** If you need access to something you don't have (production logs, dashboard, external service), say so in the report rather than guessing.
+- **Read-only** except Steps 4, 9 (instrumentation only)
+- **No destructive commands** — no `rm` (except the flag), no `DROP TABLE`, no `git reset`
+- **Max rounds enforced** — stops at max_rounds
+- **Human gate at Steps 2+3** — one message, one reply. No split turns.
+- **Browser-first** at Step 5 always
+- **Ask when blocked** — production logs, external access
 
-## When NOT to use this skill
+## When NOT to Use
 
-- **You already know the cause** — if the error message is clear ("Cannot find module 'foo'"), just fix it. Don't run an investigation loop for obvious problems.
-- **It's a feature request, not a bug** — this skill diagnoses broken things, not missing things.
-- **You need to fix it** — this skill finds the cause. Use `/feature-dev` or a code-worker to fix it after.
+- **Feature request** — diagnoses broken things, not missing things
+- **After diagnosis** — the human decides next steps. Do not suggest or dispatch anything.
+
+**If /rootcause was invoked, ALL steps are mandatory.** There is no "obvious error" shortcut. The skill exists precisely for bugs that SEEM obvious but have deeper causes. If you truly think the fix is obvious (e.g., "Cannot find module 'foo'"), don't invoke /rootcause — just fix it directly. But once invoked, every step runs. No exceptions.
+
+---
+
+## Gotchas
+
+**Static analysis will find real bugs that aren't the root cause.** Static analysis found 5 genuine bugs, all fixed, all tests passed. The actual root cause — variant navigation changes campaignId in the URL, rotating all localStorage keys — was only visible in the runtime trace. A trace showing `mount campaignId=889278dc` → `mount campaignId=5f17b9ee` → `localStorage.read key=...-5f17b9ee value=null` made it obvious. Static reading never would.
+
+**Consequence:** Always instrument. Always reproduce. Always read the trace. Hypotheses come from the trace.
+
+**Stay on your branch.** Diagnose the code in the current working tree — not what's deployed on main. Also: localStorage DOES persist across browser tool `goto` on the same origin. When localStorage appears lost after navigation, check: (1) app code writing to the same key on mount, (2) race conditions with effects, (3) origin changes.
+
+**Click for in-app navigation, goto for initial load only.** After click-based SPA navigation, re-index elements — refs go stale on navigation.
+
+---
+
+## Advanced Setup: Enforcement Hooks
+
+The skill works standalone, but you can add enforcement hooks to your Claude Code settings for stricter compliance. These hooks:
+- Block responses if `symptom` is null before diagnosis output
+- Block `git commit` if staged files contain `[ROOTCAUSE-TRACE]` markers
+- Auto-set `understanding_confirmed` and `happy_path_confirmed` when the human replies
+
+See the [rootcause GitHub repo](https://github.com/ecstatic-pirate/rootcause) for hook examples.
