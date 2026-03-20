@@ -1,0 +1,28 @@
+{
+  "name": "rootcause-skill",
+  "version": "3.3.0",
+  "description": "Autonomous root cause finder for Claude Code. 9-step evidence chain: instrument, reproduce, trace, diagnose, verify.",
+  "license": "MIT",
+  "author": "Shantanu Garg",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ecstatic-pirate/rootcause.git"
+  },
+  "keywords": [
+    "claude-code",
+    "skill",
+    "debugging",
+    "root-cause",
+    "autonomous",
+    "evidence-chain"
+  ],
+  "bin": {
+    "rootcause-skill": "install.mjs"
+  },
+  "files": [
+    "SKILL.md",
+    "install.mjs",
+    "README.md",
+    "LICENSE"
+  ]
+}
