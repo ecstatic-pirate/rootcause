@@ -50,7 +50,7 @@ cat > /tmp/claude-rootcause/evidence.json << 'EOF'
   "symptom": null, "bug_url": null,
   "awaiting_confirmation": false,
   "understanding_confirmed": false, "happy_path_confirmed": false,
-  "gstack_attempted": false, "reproduction_method": null,
+  "browser_attempted": false, "reproduction_method": null,
   "instrumentation_added": false, "reproduction_log": null,
   "runtime_trace": null, "prediction": null,
   "prediction_verified": false
@@ -74,7 +74,7 @@ with open('/tmp/claude-rootcause/evidence.json', 'w') as f: json.dump(d, f, inde
 
 **Flag path: `~/.claude/.debug-session-active`** — always this path, no other.
 
-Fields: `bug_url` required before Step 5. `gstack_attempted` always `true` when Step 5 begins. `reproduction_method`: `"browser_tool"` | `"human_logs"` | `"human_setup"`.
+Fields: `bug_url` required before Step 5. `browser_attempted` always `true` when Step 5 begins. `reproduction_method`: `"browser_tool"` | `"human_logs"` | `"human_setup"`.
 
 Set constraints: **Max rounds** 10 (override `--max-rounds N`). **Read-only** until Step 4. **Scope** stays within repo.
 
@@ -173,7 +173,7 @@ Update evidence.json: `{ "instrumentation_added": true }`
 
 ## Step 5: Reproduce — Browser Tool FIRST, localhost DEFAULT
 
-**Always set `gstack_attempted: true` at start of this step. Localhost is the default — do not ask.**
+**Always set `browser_attempted: true` at start of this step. Localhost is the default — do not ask.**
 
 1. Check `package.json` for `dev` script → start it, use `localhost:3000`.
 2. Use whatever browser tool is available (Playwright MCP, puppeteer, headless browser CLI, etc.).
@@ -185,7 +185,7 @@ Update evidence.json: `{ "instrumentation_added": true }`
 
 If human provides logs → `reproduction_method: "human_logs"`. Do NOT skip browser reproduction first.
 
-**Proceed only when** `gstack_attempted: true` AND `reproduction_log` non-null.
+**Proceed only when** `browser_attempted: true` AND `reproduction_log` non-null.
 
 ---
 
